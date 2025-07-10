@@ -8,7 +8,7 @@ from glob import iglob
 import argparse
 from einops import rearrange
 from fire import Fire
-from PIL import ExifTags, Image
+from PIL import ExifTags, Image, ImageChops
 
 
 import torch
@@ -80,6 +80,12 @@ class FluxEditor:
         #     seed = None
         
         shape = init_image.shape
+        
+        init_original = Image.fromarray(np.uint8(init_image))
+        self.t5.to("cuda")
+        self.clip.to("cuda")
+        self.ae.to("cuda")
+        self.model.to("cuda")
 
         new_h = shape[0] if shape[0] % 16 == 0 else shape[0] - shape[0] % 16
         new_w = shape[1] if shape[1] % 16 == 0 else shape[1] - shape[1] % 16
@@ -127,10 +133,10 @@ class FluxEditor:
         timesteps = get_schedule(opts.num_steps, inp["img"].shape[1], shift=(self.name != "flux-schnell"))
 
         # offload TEs to CPU, load model to gpu
-        if self.offload:
-            self.t5, self.clip = self.t5.cpu(), self.clip.cpu()
-            torch.cuda.empty_cache()
-            self.model = self.model.to(self.device)
+        #if self.offload:
+        #    self.t5, self.clip = self.t5.cpu(), self.clip.cpu()
+        #    torch.cuda.empty_cache()
+        #    self.model = self.model.to(self.device)
 
         # inversion initial noise
         with torch.no_grad():
@@ -144,10 +150,10 @@ class FluxEditor:
         x, _ = denoise(self.model, **inp_target, timesteps=timesteps, guidance=guidance, inverse=False, info=info)
 
         # offload model, load autoencoder to gpu
-        if self.offload:
-            self.model.cpu()
-            torch.cuda.empty_cache()
-            self.ae.decoder.to(x.device)
+        #if self.offload:
+        #    self.model.cpu()
+        #    torch.cuda.empty_cache()
+        #    self.ae.decoder.to(x.device)
 
         # decode latents to pixel space
         x = unpack(x.float(), opts.width, opts.height)
@@ -184,11 +190,35 @@ class FluxEditor:
         exif_data[ExifTags.Base.Model] = self.name
         if self.add_sampling_metadata:
             exif_data[ExifTags.Base.ImageDescription] = source_prompt
-        img.save(fn, exif=exif_data, quality=95, subsampling=0)
+        # img.save(fn, exif=exif_data, quality=95, subsampling=0)
 
-        
+        self.t5.to("cpu")
+        self.clip.to("cpu")
+        self.ae.to("cpu")
+        self.model.to("cpu")
+
+        init_resized = init_original.convert("RGB").resize(
+            img.size,                                 # match W×H
+            resample=Image.Resampling.LANCZOS,        # high-quality down/up-sampling
+        )
+        diff = ImageChops.difference(
+            init_resized.convert("RGB"),   # make sure both are RGB
+            img.convert("RGB")
+        )
+
+        arr1 = np.array(init_resized, dtype=np.float32)
+        arr2 = np.array(img, dtype=np.float32)
+
+        # Compute L1 and L2 distances
+        mae = np.mean(np.abs(arr1 - arr2))
+        mae_median = np.median(np.abs(arr1 - arr2))
+        mse = np.mean((arr1 - arr2) ** 2)
+        mse_median = np.median((arr1 - arr2) ** 2)
+        print("L1 Distance:", mae, "median:", mae_median)
+        print("L2 Distance:", mse, "median:", mse_median)
+
         print("End Edit")
-        return img
+        return img, diff
 
 
 
@@ -203,25 +233,25 @@ def create_demo(model_name: str, device: str = "cuda" if torch.cuda.is_available
             with gr.Column():
                 source_prompt = gr.Textbox(label="Source Prompt", value="")
                 target_prompt = gr.Textbox(label="Target Prompt", value="")
-                init_image = gr.Image(label="Input Image", visible=True)
-                
-                
                 generate_btn = gr.Button("Generate")
-            
-            with gr.Column():
                 with gr.Accordion("Advanced Options", open=True):
                     num_steps = gr.Slider(1, 30, 25, step=1, label="Number of steps")
                     inject_step = gr.Slider(1, 15, 5, step=1, label="Number of inject steps")
                     guidance = gr.Slider(1.0, 10.0, 2, step=0.1, label="Guidance", interactive=not is_schnell)
                     # seed = gr.Textbox(0, label="Seed (-1 for random)", visible=False)
                     # add_sampling_metadata = gr.Checkbox(label="Add sampling parameters to metadata?", value=False)
-                
+
+            with gr.Column():
+                init_image = gr.Image(label="Input Image", visible=True)
+            with gr.Column():
                 output_image = gr.Image(label="Generated Image")
+            with gr.Column():
+                diff_image   = gr.Image(label="Difference (|input - output|)", type="pil")
 
         generate_btn.click(
             fn=editor.edit,
             inputs=[init_image, source_prompt, target_prompt, num_steps, inject_step, guidance],
-            outputs=[output_image]
+            outputs=[output_image, diff_image]
         )
 
 
@@ -236,7 +266,7 @@ if __name__ == "__main__":
     parser.add_argument("--offload", action="store_true", help="Offload model to CPU when not in use")
     parser.add_argument("--share", action="store_true", help="Create a public link to your demo")
 
-    parser.add_argument("--port", type=int, default=41035)
+    parser.add_argument("--port", type=int, default=44035)
     args = parser.parse_args()
 
     demo = create_demo(args.name, args.device, args.offload)
