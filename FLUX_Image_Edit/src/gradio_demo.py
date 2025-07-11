@@ -60,8 +60,8 @@ class FluxEditor:
         # init all components
         self.t5 = load_t5(self.device, max_length=256 if self.name == "flux-schnell" else 512)
         self.clip = load_clip(self.device)
-        self.model = load_flow_model(self.name, device="cpu" if self.offload else self.device)
-        self.ae = load_ae(self.name, device="cpu" if self.offload else self.device)
+        self.model = load_flow_model(self.name, device="cpu")
+        self.ae = load_ae(self.name, device="cpu")
         self.t5.eval()
         self.clip.eval()
         self.ae.eval()
@@ -82,10 +82,10 @@ class FluxEditor:
         shape = init_image.shape
         
         init_original = Image.fromarray(np.uint8(init_image))
-        self.t5.to("cuda")
-        self.clip.to("cuda")
-        self.ae.to("cuda")
-        self.model.to("cuda")
+        self.t5 = self.t5.to("cuda")
+        self.clip = self.clip.to("cuda")
+        self.ae = self.ae.to("cuda")
+        self.model = self.model.to("cuda")
 
         new_h = shape[0] if shape[0] % 16 == 0 else shape[0] - shape[0] % 16
         new_w = shape[1] if shape[1] % 16 == 0 else shape[1] - shape[1] % 16
@@ -192,10 +192,11 @@ class FluxEditor:
             exif_data[ExifTags.Base.ImageDescription] = source_prompt
         # img.save(fn, exif=exif_data, quality=95, subsampling=0)
 
-        self.t5.to("cpu")
-        self.clip.to("cpu")
-        self.ae.to("cpu")
-        self.model.to("cpu")
+        self.t5 = self.t5.to("cpu")
+        self.clip = self.clip.to("cpu")
+        self.ae = self.ae.to("cpu")
+        self.model = self.model.to("cpu")
+        torch.cuda.empty_cache()
 
         init_resized = init_original.convert("RGB").resize(
             img.size,                                 # match W×H
@@ -269,5 +270,5 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=44035)
     args = parser.parse_args()
 
-    demo = create_demo(args.name, args.device, args.offload)
+    demo = create_demo(args.name, "cpu", args.offload)
     demo.launch(server_name='0.0.0.0', share=args.share, server_port=args.port)
