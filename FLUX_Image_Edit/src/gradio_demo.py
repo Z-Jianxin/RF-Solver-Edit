@@ -100,7 +100,8 @@ class FluxEditor:
     @torch.inference_mode()
     def edit(self, init_image, source_prompt, target_prompt, num_steps, inject_step, guidance, seed):
         torch.cuda.empty_cache()
-        seed = None
+        seed = int(seed) if seed else int(torch.Generator(device="cpu").seed())
+        torch.manual_seed(seed)
         # if seed == -1:
         #     seed = None
         
@@ -139,11 +140,6 @@ class FluxEditor:
         t0 = time.perf_counter()
 
         opts.seed = None
-        #if self.offload:
-        #    self.ae = self.ae.cpu()
-        #    torch.cuda.empty_cache()
-        #    self.t5, self.clip = self.t5.to(self.device), self.clip.to(self.device)
-
         #############inverse#######################
         info = {}
         info['feature'] = {}
@@ -157,12 +153,6 @@ class FluxEditor:
             inp_target = prepare(self.t5, self.clip, init_image, prompt=opts.target_prompt)
         timesteps = get_schedule(opts.num_steps, inp["img"].shape[1], shift=(self.name != "flux-schnell"))
 
-        # offload TEs to CPU, load model to gpu
-        #if self.offload:
-        #    self.t5, self.clip = self.t5.cpu(), self.clip.cpu()
-        #    torch.cuda.empty_cache()
-        #    self.model = self.model.to(self.device)
-
         # inversion initial noise
         with torch.no_grad():
             z, info = denoise(self.model, **inp, timesteps=timesteps, guidance=1, inverse=True, info=info)
@@ -173,12 +163,6 @@ class FluxEditor:
 
         # denoise initial noise
         x, _ = denoise(self.model, **inp_target, timesteps=timesteps, guidance=guidance, inverse=False, info=info)
-
-        # offload model, load autoencoder to gpu
-        #if self.offload:
-        #    self.model.cpu()
-        #    torch.cuda.empty_cache()
-        #    self.ae.decoder.to(x.device)
 
         # decode latents to pixel space
         x = unpack(x.float(), opts.width, opts.height)
@@ -227,7 +211,7 @@ class FluxEditor:
             img.size,                                 # match W×H
             resample=Image.Resampling.LANCZOS,        # high-quality down/up-sampling
         )
-        diff = ImageChops.difference(
+        diff_img = ImageChops.difference(
             init_resized.convert("RGB"),   # make sure both are RGB
             img.convert("RGB")
         )
@@ -241,23 +225,23 @@ class FluxEditor:
         print("source prompt vs source image: ")
         self.print_clip_score(init_resized, source_prompt)
 
-        arr1 = np.array(init_resized, dtype=np.float32)
-        arr2 = np.array(img, dtype=np.float32)
+        a1 = np.asarray(init_resized, dtype=np.float32)
+        a2 = np.asarray(img, dtype=np.float32)
+        # per‑channel difference
+        diff_np = a1 - a2
+        # average across the 3 channels so l1/l2 match image (H, W)
+        l1 = np.mean(np.abs(diff_np), axis=-1)      # shape (H, W)
+        l2 = np.mean(diff_np ** 2,  axis=-1)        # shape (H, W)
 
-        # Compute L1 and L2 distances
-        mae = np.mean(np.abs(arr1 - arr2))
-        mae_median = np.median(np.abs(arr1 - arr2))
-        mse = np.mean((arr1 - arr2) ** 2)
-        mse_median = np.median((arr1 - arr2) ** 2)
-        print("L1 Distance:", mae, "median:", mae_median)
-        print("L2 Distance:", mse, "median:", mse_median)
+        print("L1 Distance:", l1.mean(), "median:", np.median(l1))
+        print("L2 Distance:", l2.mean(), "median:", np.median(l2))
         
         with torch.no_grad():
             dist = self.lpips(self.lpips_transform(init_resized).to("cuda"), self.lpips_transform(img).to("cuda"))
         print("LPIPS distance: ", dist.item())
         torch.cuda.empty_cache()
         print("End Edit\n\n")
-        return img, diff
+        return img, diff_img
 
 
 
@@ -274,10 +258,10 @@ def create_demo(model_name: str, device: str = "cuda" if torch.cuda.is_available
                 target_prompt = gr.Textbox(label="Target Prompt", value="")
                 generate_btn = gr.Button("Generate")
                 with gr.Accordion("Advanced Options", open=True):
-                    num_steps = gr.Slider(1, 30, 25, step=1, label="Number of steps")
+                    num_steps = gr.Slider(1, 30, 28, step=1, label="Number of steps")
                     inject_step = gr.Slider(1, 15, 5, step=1, label="Number of inject steps")
                     guidance = gr.Slider(1.0, 10.0, 2, step=0.1, label="Guidance", interactive=not is_schnell)
-                    # seed = gr.Textbox(0, label="Seed (-1 for random)", visible=False)
+                    seed = gr.Textbox(0, label="Seed (-1 for random)", visible=True)
                     # add_sampling_metadata = gr.Checkbox(label="Add sampling parameters to metadata?", value=False)
 
             with gr.Column():
@@ -289,7 +273,7 @@ def create_demo(model_name: str, device: str = "cuda" if torch.cuda.is_available
 
         generate_btn.click(
             fn=editor.edit,
-            inputs=[init_image, source_prompt, target_prompt, num_steps, inject_step, guidance],
+            inputs=[init_image, source_prompt, target_prompt, num_steps, inject_step, guidance, seed],
             outputs=[output_image, diff_image]
         )
 
