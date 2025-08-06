@@ -24,6 +24,7 @@ from transformers import CLIPProcessor, CLIPModel
 import lpips
 import torchvision.transforms as transforms
 
+import timm
 
 @dataclass
 class SamplingOptions:
@@ -77,14 +78,29 @@ class FluxEditor:
             torch.cuda.empty_cache()
             self.ae.encoder.to(self.device)
 
-        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32") # it's lightweighted so it can live on CPU
-        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14-336") # it's lightweighted so it can live on CPU
+        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14-336")
         self.lpips = lpips.LPIPS(net='vgg').to('cuda')
         self.lpips_transform = transforms.Compose([
             transforms.Resize((1024, 1024)),  # resize for consistency (optional)
             transforms.ToTensor(),
             transforms.Normalize((0.5,), (0.5,))  # LPIPS expects inputs in [-1, 1]
         ])
+        
+        self.dino = timm.create_model('vit_small_patch16_224.dino', pretrained=True, num_classes=0).to('cuda')
+        self.dino.eval()
+        self.dino_transform = transforms.Compose([
+            transforms.Resize(256), transforms.CenterCrop(224), transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    def dino_dist(self, img1, img2):
+        img1 = self.dino_transform(img1).unsqueeze(0)
+        img2 = self.dino_transform(img2).unsqueeze(0)
+        with torch.no_grad():
+            emb1 = F.normalize(self.dino(img1.to('cuda')), dim=1)
+            emb2 = F.normalize(self.dino(img2.to('cuda')), dim=1)
+        return F.cosine_similarity(emb1, emb2).item()
 
     def print_clip_score(self, image, prompt):
         clip_inputs = self.clip_processor(
@@ -239,6 +255,11 @@ class FluxEditor:
         with torch.no_grad():
             dist = self.lpips(self.lpips_transform(init_resized).to("cuda"), self.lpips_transform(img).to("cuda"))
         print("LPIPS distance: ", dist.item())
+    
+        with torch.no_grad():
+            dist = self.dino_dist(init_resized, img)
+        print("DINO distance: ", 1.0-dist)
+
         torch.cuda.empty_cache()
         print("End Edit\n\n")
         return img, diff_img
