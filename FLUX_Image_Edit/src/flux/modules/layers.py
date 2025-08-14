@@ -249,7 +249,7 @@ class SingleStreamBlock(nn.Module):
             if info['inverse']:
                 info['feature'][feature_name] = v.cpu()
             else:
-                v = info['feature'][feature_name].cuda()
+                v = info['feature'][feature_name].to(q.device)
 
         # compute attention
         attn = attention(q, k, v, pe=pe)

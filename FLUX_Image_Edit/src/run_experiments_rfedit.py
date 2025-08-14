@@ -127,38 +127,27 @@ class FluxEditor:
         # init components (identical to demo)
         self.t5    = load_t5(self.device, max_length=256 if self.is_schnell else 512)
         self.clip  = load_clip(self.device)
-        self.model = load_flow_model(self.name, device="cpu")
-        self.ae    = load_ae(self.name, device="cpu")
+        if self.offload:
+            self.model = load_flow_model(self.name, device="cpu")
+            self.ae    = load_ae(self.name, device="cpu")
+        else:
+            self.model = load_flow_model(self.name, device=self.device)
+            self.ae    = load_ae(self.name, device=self.device)
         for m in (self.t5, self.clip, self.model, self.ae):
             m.eval()
-
-        if self.offload:
-            self.model.cpu()
-            torch.cuda.empty_cache()
-            self.ae.encoder.to(self.device)
-
-    # ------------- helper: encode to latent (demo code) -----
-    @torch.inference_mode()
-    def _encode(self, np_img):
-        img = torch.from_numpy(np_img.copy()).permute(2, 0, 1).float() / 127.5 - 1
-        img = img.unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            lat = self.ae.encode(img).to(torch.bfloat16)
-        return lat
 
     # ------------- main edit function (demo logic) ----------
     @torch.inference_mode()
     def edit(self, init_pil: Image.Image, source_prompt: str, target_prompt: str,
              *, num_steps: int, inject_step: int, guidance: float, seed: int):
         torch.manual_seed(seed)
+        if self.offload:
+            self.model.cpu()
+            torch.cuda.empty_cache()
+            self.ae.encoder.to(self.device)
         
         init_image = np.array(init_pil)
         shape = init_image.shape
-
-        self.t5 = self.t5.to("cuda")
-        self.clip = self.clip.to("cuda")
-        self.ae = self.ae.to("cuda")
-        self.model = self.model.to("cuda")
 
         new_h = shape[0] if shape[0] % 16 == 0 else shape[0] - shape[0] % 16
         new_w = shape[1] if shape[1] % 16 == 0 else shape[1] - shape[1] % 16
@@ -167,8 +156,6 @@ class FluxEditor:
 
         width, height = init_image.shape[0], init_image.shape[1]
         init_image = encode(init_image, self.device, self.ae)
-
-        print(init_image.shape)
 
         opts = SamplingOptions(
             source_prompt=source_prompt,
@@ -185,6 +172,11 @@ class FluxEditor:
         print(f"Generating with seed {opts.seed}:\n{opts.source_prompt}")
 
         opts.seed = None
+        
+        if self.offload:
+            self.ae = self.ae.cpu()
+            torch.cuda.empty_cache()
+            self.t5, self.clip = self.t5.to(self.device), self.clip.to(self.device)
         #############inverse#######################
         info = {}
         info['feature'] = {}
@@ -198,6 +190,12 @@ class FluxEditor:
             inp_target = prepare(self.t5, self.clip, init_image, prompt=opts.target_prompt)
         timesteps = get_schedule(opts.num_steps, inp["img"].shape[1], shift=(self.name != "flux-schnell"))
 
+        # offload TEs to CPU, load model to gpu
+        if self.offload:
+            self.t5, self.clip = self.t5.cpu(), self.clip.cpu()
+            torch.cuda.empty_cache()
+            self.model = self.model.to(self.device)
+
         # inversion initial noise
         with torch.no_grad():
             z, info = denoise(self.model, **inp, timesteps=timesteps, guidance=1, inverse=True, info=info)
@@ -208,6 +206,12 @@ class FluxEditor:
 
         # denoise initial noise
         x, _ = denoise(self.model, **inp_target, timesteps=timesteps, guidance=guidance, inverse=False, info=info)
+        
+        # offload model, load autoencoder to gpu
+        if self.offload:
+            self.model.cpu()
+            torch.cuda.empty_cache()
+            self.ae.decoder.to(x.device)
 
         # decode latents to pixel space
         x = unpack(x.float(), opts.width, opts.height)
@@ -224,6 +228,8 @@ class FluxEditor:
         x = rearrange(x[0], "c h w -> h w c")
 
         img = Image.fromarray((127.5 * (x + 1.0)).cpu().byte().numpy())
+        if self.offload:
+            self.ae.decoder.cpu()
         return img
 
 
